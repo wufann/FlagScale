@@ -16,7 +16,7 @@ from megatron.core.tensor_parallel.utils import VocabUtility, divide
 from torch.nn.parameter import Parameter
 _grad_accum_fusion_available = True
 try:
-    import mlu_fused_kernels
+    import fused_weight_gradient_dense as mlu_fused_kernels # from apex-mlu
 except ImportError:
     _grad_accum_fusion_available = False
 
@@ -105,7 +105,7 @@ def LinearWithGradAccumulationAndAsyncCommunicationBackward(ctx, grad_output):
         #         total_input, grad_output, weight.main_grad
         #     )
         if weight.main_grad.dtype in (torch.float32, torch.float16, torch.bfloat16):
-            mlu_fused_kernels.wgrad_gemm_accum(total_input, grad_output, weight.main_grad)
+            mlu_fused_kernels.wgrad_gemm_accum_fp16(total_input, grad_output, weight.main_grad)
         else:
             raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
         grad_weight = None

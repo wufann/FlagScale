@@ -2,7 +2,14 @@
 
 from apex.optimizers import FusedAdam as Adam
 # from torch.optim import AdamW as Adam
-from apex.optimizers import FusedSGD as SGD
+#from apex.optimizers import FusedSGD as SGD
+try:
+    import torch_mlu
+    from apex.optimizers import FusedAdam as Adam
+    from torch.optim import SGD
+except Exception:
+    print('WARNING: APEX_mlu is not installed')
+    torch_mlu = None
 
 from megatron import get_args
 

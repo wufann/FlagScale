@@ -4,13 +4,34 @@ import torch
 import torch_mlu
 from torch import nn
 import megatron
-from torch.nn.modules.normalization import LayerNorm
+#from torch.nn.modules.normalization import LayerNorm
+#from megatron.model import LayerNorm
+#from megatron.model.fused_layer_norm import MixedFusedLayerNorm as LayerNorm
+import numbers
+from torch.nn.parameter import Parameter
+from torch.nn import init
 from megatron.model.enums import AttnMaskType, LayerType, AttnType, ModelType
 from megatron import get_timers, get_args, get_retro_args, core, get_num_microbatches, get_hetero_context
 from megatron.model.transformer import ParallelTransformerLayer, ParallelAttention, ParallelMLP, ParallelTransformer, _get_num_layers, _get_layer_type
 from megatron.core import mpu, tensor_parallel
 from contextlib import nullcontext
 from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
+import importlib
+
+from megatron.core.utils import make_viewless_tensor
+
+try:
+    from apex.contrib.layer_norm.layer_norm import FastLayerNormFN
+    HAVE_PERSIST_LAYER_NORM = True
+except:
+    HAVE_PERSIST_LAYER_NORM = False
+
+try:
+    #from apex.normalization.fused_layer_norm import FusedLayerNormAffineFunction
+    from apex.normalization.fused_layer_norm import FusedRMSNormAffineFunction
+except:
+    FusedLayerNormAffineFunction = None
+    FusedRMSNormAffineFunction = None
 
 try:
     from einops import rearrange
@@ -26,6 +47,91 @@ except ImportError:
     except ImportError:
         flash_attn_unpadded_func = None
 
+class MixedFusedLayerNorm(torch.nn.Module):
+
+  def __init__(self, normalized_shape, eps=1e-5,
+               no_persist_layer_norm=True,
+               sequence_parallel=False,
+               apply_layernorm_1p=False,
+               apply_layernorm_rms=False,
+               init_weight=None):
+        super(MixedFusedLayerNorm, self).__init__()
+
+        self.apply_layernorm_1p = apply_layernorm_1p
+        self.apply_layernorm_rms = apply_layernorm_rms
+        assert not (self.apply_layernorm_1p and self.apply_layernorm_rms), \
+            "Cannot apply both 1p and rms layernorm"
+
+        self.init_weight = init_weight
+        assert self.init_weight is None or isinstance(self.init_weight, float), \
+            "Cannot init_weight of None or of non-float"
+        assert not (self.init_weight is not None and self.apply_layernorm_1p), \
+            "Cannot float init_weight and 1p layernorm"
+
+        # global fused_layer_norm_cuda
+        # fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
+
+        # List of hiddens sizes supported in the persistent layer norm kernel
+        # If the hidden size is not supported, fall back to the non-persistent
+        # kernel.
+        persist_ln_hidden_sizes = [1024, 1536, 2048, 2304, 3072, 3840, 4096,
+            5120, 6144, 8192, 10240, 12288, 12800, 15360, 16384, 18432, 20480,
+            24576, 25600, 30720, 32768, 40960, 49152, 65536]
+        if normalized_shape not in persist_ln_hidden_sizes or \
+                not HAVE_PERSIST_LAYER_NORM:
+            no_persist_layer_norm = True
+
+        if isinstance(normalized_shape, numbers.Integral):
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = torch.Size(normalized_shape)
+        self.eps = eps
+        self.weight = Parameter(torch.Tensor(*normalized_shape))
+        # no bias parameter when using rms layernorm
+        if not self.apply_layernorm_rms:
+            self.bias = Parameter(torch.Tensor(*normalized_shape))
+        self.reset_parameters()
+        self.no_persist_layer_norm = no_persist_layer_norm
+        self.sequence_parallel = sequence_parallel
+
+        # set sequence parallelism flag on weight and bias parameters
+        setattr(self.weight, 'sequence_parallel', self.sequence_parallel)
+        if not self.apply_layernorm_rms:
+            setattr(self.bias, 'sequence_parallel', self.sequence_parallel)
+
+
+  def reset_parameters(self):
+
+    if self.apply_layernorm_1p:
+        init.zeros_(self.weight)
+        init.zeros_(self.bias)
+    else:
+        if self.init_weight:
+            init.constant_(self.weight, self.init_weight)
+        else:
+            init.ones_(self.weight)
+        if not self.apply_layernorm_rms:
+            init.zeros_(self.bias)
+
+  def forward(self, input):
+
+    weight = self.weight + 1 if self.apply_layernorm_1p else self.weight
+
+    if self.apply_layernorm_rms:
+        return FusedRMSNormAffineFunction.apply(input, weight, self.normalized_shape, self.eps)
+    elif self.no_persist_layer_norm:
+        return FusedLayerNormAffineFunction.apply(input, weight, self.bias, self.normalized_shape, self.eps)
+    else:
+        output = FastLayerNormFN.apply(input, weight, self.bias, self.eps)
+
+        # Apex's fast layer norm function outputs a 'view' tensor (i.e., has
+        # a populated '_base' field). This will result in schedule.py's
+        # deallocate_output_tensor() throwing an error, so a viewless tensor is
+        # created to prevent this.
+        output = make_viewless_tensor(inp = output,
+                                      requires_grad = input.requires_grad,
+                                      keep_graph = True)
+
+        return output
 
 def _repeat_interleave_op(x, num_repeats):
     # only support 4D tensor, dim=2
@@ -64,21 +170,21 @@ class RMSNorm(torch.nn.Module):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
-def get_norm(config):
-    args = get_args()
-    if args.normalization == "LayerNorm" and args.apply_layernorm_rms == False:
-        return LayerNorm(
-            config.hidden_size,
-            eps=config.layernorm_epsilon)
-    elif args.normalization == "RMSNorm" or args.apply_layernorm_rms == True:
-        if args.apply_layernorm_1p:
-            raise NotImplementedError('RMSNorm does not currently support the layernorm_1p formulation.')
-
-        return RMSNorm(dim=config.hidden_size,
-                       eps=config.layernorm_epsilon,
-                       sequence_parallel=config.sequence_parallel)
-    else:
-        raise Exception(f"unsupported norm type '{args.normalization}'.")
+# def get_norm(config):
+#     args = get_args()
+#     if args.normalization == "LayerNorm" and args.apply_layernorm_rms == False:
+#         return LayerNorm(
+#             config.hidden_size,
+#             eps=config.layernorm_epsilon)
+#     elif args.normalization == "RMSNorm" or args.apply_layernorm_rms == True:
+#         if args.apply_layernorm_1p:
+#             raise NotImplementedError('RMSNorm does not currently support the layernorm_1p formulation.')
+# 
+#         return RMSNorm(dim=config.hidden_size,
+#                        eps=config.layernorm_epsilon,
+#                        sequence_parallel=config.sequence_parallel)
+#     else:
+#         raise Exception(f"unsupported norm type '{args.normalization}'.")
 
 def ParallelTransformerLayerInit(self, config,
                  layer_number, layer_type=LayerType.encoder,
@@ -101,18 +207,18 @@ def ParallelTransformerLayerInit(self, config,
         self.apply_residual_connection_post_layernorm \
             = config.apply_residual_connection_post_layernorm
 
-        self.bf16 = config.bf16
+        # self.bf16 = config.bf16
         self.fp32_residual_connection = config.fp32_residual_connection
 
-        # self.input_layernorm = LayerNorm(
-        #     config.hidden_size,
-        #     eps=config.layernorm_epsilon,
-        #     no_persist_layer_norm=args.no_persist_layer_norm,
-        #     sequence_parallel=config.sequence_parallel,
-        #     apply_layernorm_1p=args.apply_layernorm_1p,
-        #     apply_layernorm_rms=args.apply_layernorm_rms,
-        #     init_weight=self.init_weight_attn_norm)
-        self.input_layernorm = get_norm(config)
+        self.input_layernorm = MixedFusedLayerNorm(
+            config.hidden_size,
+            eps=config.layernorm_epsilon,
+            no_persist_layer_norm=args.no_persist_layer_norm,
+            sequence_parallel=config.sequence_parallel,
+            apply_layernorm_1p=args.apply_layernorm_1p,
+            apply_layernorm_rms=args.apply_layernorm_rms,
+            init_weight=self.init_weight_attn_norm)
+        # self.input_layernorm = get_norm(config)
 
 
 
@@ -128,15 +234,15 @@ def ParallelTransformerLayerInit(self, config,
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
 
         # Layernorm on the attention output
-        # self.post_attention_layernorm = LayerNorm(
-        #     config.hidden_size,
-        #     eps=config.layernorm_epsilon,
-        #     no_persist_layer_norm=not config.persist_layer_norm,
-        #     sequence_parallel=config.sequence_parallel,
-        #     apply_layernorm_1p=args.apply_layernorm_1p,
-        #     apply_layernorm_rms=args.apply_layernorm_rms,
-        #     init_weight=self.init_weight_ffn_norm)
-        self.post_attention_layernorm = get_norm(config)
+        self.post_attention_layernorm = MixedFusedLayerNorm(
+            config.hidden_size,
+            eps=config.layernorm_epsilon,
+            no_persist_layer_norm=not config.persist_layer_norm,
+            sequence_parallel=config.sequence_parallel,
+            apply_layernorm_1p=args.apply_layernorm_1p,
+            apply_layernorm_rms=args.apply_layernorm_rms,
+            init_weight=self.init_weight_ffn_norm)
+        # self.post_attention_layernorm = get_norm(config)
 
         # Cross attention.
         if self.layer_type in (LayerType.decoder,
@@ -148,13 +254,13 @@ def ParallelTransformerLayerInit(self, config,
                 layer_number,
                 attention_type=AttnType.cross_attn)
             # Layernorm on the attention output.
-            # self.post_inter_attention_layernorm = LayerNorm(
-            #     config.hidden_size,
-            #     eps=config.layernorm_epsilon,
-            #     no_persist_layer_norm=not config.persist_layer_norm,
-            #     sequence_parallel=config.sequence_parallel,
-            #     apply_layernorm_1p=args.apply_layernorm_1p)
-            self.post_inter_attention_layernorm = get_norm(config)
+            self.post_inter_attention_layernorm = MixedFusedLayerNorm(
+                config.hidden_size,
+                eps=config.layernorm_epsilon,
+                no_persist_layer_norm=not config.persist_layer_norm,
+                sequence_parallel=config.sequence_parallel,
+                apply_layernorm_1p=args.apply_layernorm_1p)
+            # self.post_inter_attention_layernorm = get_norm(config)
 
         # MLP
         if args.num_experts is not None:
@@ -410,15 +516,15 @@ def ParallelTransformerInit(self, config,
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
-            # self.final_layernorm = LayerNorm(
-            #     config.hidden_size,
-            #     eps=config.layernorm_epsilon,
-            #     no_persist_layer_norm=args.no_persist_layer_norm,
-            #     sequence_parallel=config.sequence_parallel,
-            #     apply_layernorm_1p=args.apply_layernorm_1p,
-            #     apply_layernorm_rms=args.apply_layernorm_rms,
-            #     init_weight=self.init_weight_output_norm)
-            self.final_layernorm = get_norm(config)
+            self.final_layernorm = MixedFusedLayerNorm(
+                config.hidden_size,
+                eps=config.layernorm_epsilon,
+                no_persist_layer_norm=args.no_persist_layer_norm,
+                sequence_parallel=config.sequence_parallel,
+                apply_layernorm_1p=args.apply_layernorm_1p,
+                apply_layernorm_rms=args.apply_layernorm_rms,
+                init_weight=self.init_weight_output_norm)
+            # self.final_layernorm = get_norm(config)
 
 def FlashSelfAttentionForward(self, q, k, v):
     """Implements the multihead softmax attention.
